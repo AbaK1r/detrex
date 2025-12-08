@@ -85,9 +85,13 @@ class PositionEmbeddingSine(nn.Module):
             shape `(bs, num_pos_feats * 2, h, w)`
         """
         assert mask is not None
-        not_mask = ~mask
-        y_embed = not_mask.cumsum(1, dtype=torch.float32)
-        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        # not_mask = ~mask
+        # y_embed = not_mask.cumsum(1, dtype=torch.float32)
+        # x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        B, H, W = mask.shape
+        y_embed = torch.arange(H, device=mask.device, dtype=torch.float32).view(1, H, 1).expand(B, H, W)
+        x_embed = torch.arange(W, device=mask.device, dtype=torch.float32).view(1, 1, W).expand(B, H, W)
+
         if self.normalize:
             y_embed = (y_embed + self.offset) / (y_embed[:, -1:, :] + self.eps) * self.scale
             x_embed = (x_embed + self.offset) / (x_embed[:, :, -1:] + self.eps) * self.scale

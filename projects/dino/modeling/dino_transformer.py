@@ -289,10 +289,13 @@ class DINOTransformer(nn.Module):
             valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
             valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
 
-            grid_y, grid_x = torch.meshgrid(
-                torch.linspace(0, H - 1, H, dtype=torch.float32, device=memory.device),
-                torch.linspace(0, W - 1, W, dtype=torch.float32, device=memory.device),
-            )
+            # grid_y, grid_x = torch.meshgrid(
+            #     torch.linspace(0, H - 1, H, dtype=torch.float32, device=memory.device),
+            #     torch.linspace(0, W - 1, W, dtype=torch.float32, device=memory.device),
+            # )
+            grid_y = torch.arange(H, dtype=torch.float32, device=memory.device).view(H, 1).expand(H, W)
+            grid_x = torch.arange(W, dtype=torch.float32, device=memory.device).view(1, W).expand(H, W)
+
             grid = torch.cat([grid_x.unsqueeze(-1), grid_y.unsqueeze(-1)], -1)
 
             scale = torch.cat([valid_W.unsqueeze(-1), valid_H.unsqueeze(-1)], 1).view(N, 1, 1, 2)
@@ -338,10 +341,16 @@ class DINOTransformer(nn.Module):
         reference_points_list = []
         for lvl, (H, W) in enumerate(spatial_shapes):
             #  TODO  check this 0.5
-            ref_y, ref_x = torch.meshgrid(
-                torch.linspace(0.5, H - 0.5, H, dtype=torch.float32, device=device),
-                torch.linspace(0.5, W - 0.5, W, dtype=torch.float32, device=device),
-            )
+            # ref_y, ref_x = torch.meshgrid(
+            #     torch.linspace(0.5, H - 0.5, H, dtype=torch.float32, device=device),
+            #     torch.linspace(0.5, W - 0.5, W, dtype=torch.float32, device=device),
+            # )
+
+            ref_y = torch.arange(H, dtype=torch.float32, device=device) + 0.5
+            ref_x = torch.arange(W, dtype=torch.float32, device=device) + 0.5
+            ref_y = ref_y.view(H, 1).expand(H, W)
+            ref_x = ref_x.view(1, W).expand(H, W)
+
             ref_y = ref_y.reshape(-1)[None] / (valid_ratios[:, None, lvl, 1] * H)
             ref_x = ref_x.reshape(-1)[None] / (valid_ratios[:, None, lvl, 0] * W)
             ref = torch.stack((ref_x, ref_y), -1)
@@ -390,12 +399,17 @@ class DINOTransformer(nn.Module):
         feat_flatten = torch.cat(feat_flatten, 1)
         mask_flatten = torch.cat(mask_flatten, 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
-        spatial_shapes = torch.as_tensor(
-            spatial_shapes, dtype=torch.long, device=feat_flatten.device
-        )
-        level_start_index = torch.cat(
-            (spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1])
-        )
+        # spatial_shapes = torch.as_tensor(
+        #     spatial_shapes, dtype=torch.long, device=feat_flatten.device
+        # )
+        # level_start_index = torch.cat(
+        #     (spatial_shapes.new_zeros((1,)), spatial_shapes.prod(1).cumsum(0)[:-1])
+        # )
+        level_start_index = torch.cat((
+            torch.zeros((1,), dtype=torch.long, device=feat_flatten.device),
+            torch.tensor([h * w for h, w in spatial_shapes[:-1]],
+                         dtype=torch.long, device=feat_flatten.device).cumsum(0)
+        ))
         valid_ratios = torch.stack([self.get_valid_ratio(m) for m in multi_level_masks], 1)
 
         reference_points = self.get_reference_points(

@@ -108,10 +108,10 @@ class DINO(nn.Module):
         self.box_noise_scale = box_noise_scale
 
         # normalizer for input raw images
-        self.device = device
-        pixel_mean = torch.Tensor(pixel_mean).to(self.device).view(3, 1, 1)
-        pixel_std = torch.Tensor(pixel_std).to(self.device).view(3, 1, 1)
-        self.normalizer = lambda x: (x - pixel_mean) / pixel_std
+        self.device = None
+        # pixel_mean = torch.Tensor(pixel_mean).to(self.device).view(3, 1, 1)
+        # pixel_std = torch.Tensor(pixel_std).to(self.device).view(3, 1, 1)
+        # self.normalizer = lambda x: (x - pixel_mean) / pixel_std
 
         # initialize weights
         prior_prob = 0.01
@@ -174,6 +174,8 @@ class DINO(nn.Module):
                             dictionnaries containing the two above keys for each decoder layer.
         """
         images = self.preprocess_image(batched_inputs)
+        # print(images.tensor.max(), images.tensor.min(), images.tensor.shape)
+        self.device = images.tensor.device
 
         if self.training:
             batch_size, _, H, W = images.tensor.shape
@@ -500,7 +502,8 @@ class DINO(nn.Module):
         return outputs_class, outputs_coord
 
     def preprocess_image(self, batched_inputs):
-        images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
+        # images = [self.normalizer(x["image"].to(self.device)) for x in batched_inputs]
+        images = [x["image"] for x in batched_inputs]
         images = ImageList.from_tensors(images)
         return images
 

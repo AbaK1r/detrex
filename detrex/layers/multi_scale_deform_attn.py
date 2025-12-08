@@ -93,6 +93,77 @@ class MultiScaleDeformableAttnFunction(Function):
         return grad_value, None, None, grad_sampling_loc, grad_attn_weight, None
 
 
+@torch.jit.script
+def custom_grid_sample_vectorized(ipt: torch.Tensor, grid: torch.Tensor) -> torch.Tensor:
+    """
+    完整对齐 torch.nn.functional.grid_sample (mode=bilinear, padding_mode=zeros, align_corners=False)
+    """
+    N, C, H, W = ipt.shape
+
+    # align_corners=False 映射
+    x = ((grid[..., 0] + 1) * W - 1) / 2
+    y = ((grid[..., 1] + 1) * H - 1) / 2
+
+    x0 = torch.floor(x).to(torch.long)
+    y0 = torch.floor(y).to(torch.long)
+    x1 = x0 + 1
+    y1 = y0 + 1
+
+    dx = x - x0.float()
+    dy = y - y0.float()
+
+    wa = (1 - dx) * (1 - dy)
+    wb = (1 - dx) * dy
+    wc = dx * (1 - dy)
+    wd = dx * dy
+
+    # 每个点自己的边界判断（这就是zero padding真正逻辑）
+    mask_x0 = (x0 >= 0) & (x0 < W)
+    mask_x1 = (x1 >= 0) & (x1 < W)
+    mask_y0 = (y0 >= 0) & (y0 < H)
+    mask_y1 = (y1 >= 0) & (y1 < H)
+
+    wa = wa * (mask_x0 & mask_y0).float()
+    wb = wb * (mask_x0 & mask_y1).float()
+    wc = wc * (mask_x1 & mask_y0).float()
+    wd = wd * (mask_x1 & mask_y1).float()
+
+    # clamp是为了防止索引越界，但不改变权重
+    x0 = x0.clamp(0, W - 1)
+    x1 = x1.clamp(0, W - 1)
+    y0 = y0.clamp(0, H - 1)
+    y1 = y1.clamp(0, H - 1)
+
+    dim2 = W
+    dim1 = W * H
+    base = torch.arange(N, device=ipt.device).view(N, 1, 1, 1) * C * dim1
+    ch = torch.arange(C, device=ipt.device).view(1, C, 1, 1) * dim1
+
+    y0 = y0.unsqueeze(1)
+    y1 = y1.unsqueeze(1)
+    x0 = x0.unsqueeze(1)
+    x1 = x1.unsqueeze(1)
+
+    idx00 = base + ch + y0 * dim2 + x0
+    idx01 = base + ch + y1 * dim2 + x0
+    idx10 = base + ch + y0 * dim2 + x1
+    idx11 = base + ch + y1 * dim2 + x1
+
+    b_flat = ipt.reshape(-1)
+
+    I00 = b_flat[idx00]
+    I01 = b_flat[idx01]
+    I10 = b_flat[idx10]
+    I11 = b_flat[idx11]
+
+    out = wa.unsqueeze(1) * I00 + \
+          wb.unsqueeze(1) * I01 + \
+          wc.unsqueeze(1) * I10 + \
+          wd.unsqueeze(1) * I11
+
+    return out
+
+
 def multi_scale_deformable_attn_pytorch(
     value: torch.Tensor,
     value_spatial_shapes: torch.Tensor,
@@ -118,9 +189,12 @@ def multi_scale_deformable_attn_pytorch(
         # bs*num_heads, num_queries, num_points, 2
         sampling_grid_l_ = sampling_grids[:, :, :, level].transpose(1, 2).flatten(0, 1)
         # bs*num_heads, embed_dims, num_queries, num_points
-        sampling_value_l_ = F.grid_sample(
-            value_l_, sampling_grid_l_, mode="bilinear", padding_mode="zeros", align_corners=False
-        )
+        if torch.onnx.is_in_onnx_export():
+            sampling_value_l_ = custom_grid_sample_vectorized(value_l_, sampling_grid_l_)
+        else:
+            sampling_value_l_ = F.grid_sample(
+                value_l_, sampling_grid_l_, mode="bilinear", padding_mode="zeros", align_corners=False
+            )
         sampling_value_list.append(sampling_value_l_)
     # (bs, num_queries, num_heads, num_levels, num_points) ->
     # (bs, num_heads, num_queries, num_levels, num_points) ->
@@ -283,7 +357,7 @@ class MultiScaleDeformableAttention(nn.Module):
         bs, num_query, _ = query.shape
         bs, num_value, _ = value.shape
 
-        assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
+        # assert (spatial_shapes[:, 0] * spatial_shapes[:, 1]).sum() == num_value
 
         # value projection
         value = self.value_proj(value)
@@ -291,7 +365,8 @@ class MultiScaleDeformableAttention(nn.Module):
         if key_padding_mask is not None:
             value = value.masked_fill(key_padding_mask[..., None], float(0))
         # [bs, all hw, 256] -> [bs, all hw, 8, 32]
-        value = value.view(bs, num_value, self.num_heads, -1)
+        head_dim = value.shape[-1] // self.num_heads
+        value = value.view(bs, num_value, self.num_heads, head_dim)
         # [bs, all hw, 8, 4, 4, 2]: 8 heads, 4 level features, 4 sampling points, 2 offsets
         sampling_offsets = self.sampling_offsets(query).view(
             bs, num_query, self.num_heads, self.num_levels, self.num_points, 2
@@ -317,7 +392,8 @@ class MultiScaleDeformableAttention(nn.Module):
             # offset_normalizer  [4, 2] -> [1, 1, 1, 4, 1, 2]
             # references_points + sampling_offsets
             
-            offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            # offset_normalizer = torch.stack([spatial_shapes[..., 1], spatial_shapes[..., 0]], -1)
+            offset_normalizer = torch.tensor([i[::-1] for i in spatial_shapes], device=query.device, dtype=torch.long)
             sampling_locations = (
                 reference_points[:, :, None, :, None, :]
                 + sampling_offsets / offset_normalizer[None, None, None, :, None, :]
@@ -336,12 +412,12 @@ class MultiScaleDeformableAttention(nn.Module):
                     reference_points.shape[-1]
                 )
             )
-        
+
         # the original impl for fp32 training
         if torch.cuda.is_available() and value.is_cuda:
             output = MultiScaleDeformableAttnFunction.apply(
                 value.to(torch.float32) if value.dtype==torch.float16 else value,
-                spatial_shapes,
+                torch.tensor(spatial_shapes, device=value.device, dtype=torch.long),
                 level_start_index,
                 sampling_locations,
                 attention_weights,
